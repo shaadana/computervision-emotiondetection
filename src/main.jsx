@@ -35,14 +35,25 @@ const callPrompts = [
   'What is a recent accomplishment you are proud of, and why did it matter?',
   'Describe a moment when you had to communicate under pressure.',
   'What kind of impression do you want to leave after this conversation?',
+  'If you could change one thing about how you approach new projects, what would it be?',
+  'Tell me about a time you had to learn a complex skill quickly.',
+  'How do you stay motivated when facing a repetitive or slow-moving task?',
+  'What does successful collaboration look like to you in a high-stakes environment?',
+  'Describe a situation where you had to give difficult feedback to a peer.',
+  'What is the most important lesson you have learned from a failure?',
+  'Tell me about a time you had to manage a conflict within a team.',
+  'How do you prioritize your workload when everything feels like a top priority?',
+  'What is one professional goal you are currently working toward?',
+  'Describe a time when you went above and beyond for a client or colleague.',
 ];
 
-const conversationSystem = `You are a thoughtful conversation partner in a practice video call, not a performance reviewer.
-Keep the call flowing naturally. Reply to the substance of what the user said, add one brief human observation or related thought, then ask exactly one follow-up question.
-Do not list tips, do not score them, do not mention delivery metrics, and do not lecture. Keep the response under 45 words.`;
+const conversationSystem = `You are a warm, perceptive conversation coach in a practice call.
+Reply with empathy and insight based on what the user shared. Add a brief, encouraging observation about their tone or delivery, then ask exactly one thoughtful follow-up question to probe deeper.
+Avoid generic advice or scoring. Keep the response between 25 and 60 words. Use a professional yet supportive tone.
+IMPORTANT: Respond ONLY with the direct dialogue you would say aloud to the user. Do not include internal thoughts, labels like "Assistant:", or any metadata.`;
 
 const defaultOllamaModel = 'llama3.1';
-const defaultTransformersModel = 'HuggingFaceTB/SmolLM2-135M-Instruct';
+const defaultTransformersModel = 'onnx-community/Qwen2.5-0.5B-Instruct';
 const ollamaEndpoint = 'http://127.0.0.1:11434/api/generate';
 
 function analyzeContent(text) {
@@ -120,7 +131,8 @@ function useCameraAnalysis(videoRef, canvasRef, active) {
       let upperSamples = 0;
       let midSamples = 0;
       let lowerSamples = 0;
-      let sideSamples = 0;
+      let leftSamples = 0;
+      let rightSamples = 0;
 
       for (let y = 24; y < 102; y += 4) {
         for (let x = 38; x < 124; x += 4) {
@@ -144,10 +156,11 @@ function useCameraAnalysis(videoRef, canvasRef, active) {
           }
           if (x < 82) {
             leftBrightness += avg;
+            leftSamples += 1;
           } else {
             rightBrightness += avg;
+            rightSamples += 1;
           }
-          sideSamples += 1;
           samples += 1;
         }
       }
@@ -158,14 +171,15 @@ function useCameraAnalysis(videoRef, canvasRef, active) {
       const upper = upperBrightness / upperSamples;
       const mid = midBrightness / midSamples;
       const lower = lowerBrightness / lowerSamples;
-      const left = leftBrightness / Math.max(sideSamples / 2, 1);
-      const right = rightBrightness / Math.max(sideSamples / 2, 1);
+      const left = leftBrightness / Math.max(leftSamples, 1);
+      const right = rightBrightness / Math.max(rightSamples, 1);
       const asymmetry = Math.abs(left - right);
-      const mouthLift = clamp((lower - mid + 18) * 2.1);
-      const browTension = clamp((upper - mid + movement * 0.9 + 18) * 1.6);
-      const mouthOpenness = clamp((Math.abs(lower - mid) + movement * 0.55) * 2.2);
-      const cheekLift = clamp((warm * 0.9 + lower - upper + 28) * 1.35);
-      const jawSet = clamp((movement * 1.45 + Math.abs(lower - bright) * 0.9));
+      const sensitivity = clamp(1.0 + (128 - bright) * 0.002, 0.8, 1.2);
+      const mouthLift = clamp((lower - mid + 20) * 2.2 * sensitivity);
+      const browTension = clamp((upper - mid + movement * 1.1 + 15) * 1.8 * sensitivity);
+      const mouthOpenness = clamp((Math.abs(lower - mid) + movement * 0.6) * 2.4 * sensitivity);
+      const cheekLift = clamp((warm * 1.0 + lower - upper + 30) * 1.4 * sensitivity);
+      const jawSet = clamp((movement * 1.6 + Math.abs(lower - bright) * 1.0) * sensitivity);
       const next = {
         Warmth: clamp(48 + warm * 0.7 + bright * 0.05),
         Focus: clamp(88 - Math.abs(bright - 128) * 0.38),
@@ -234,6 +248,9 @@ function App() {
   const coachReplyTimerRef = useRef(null);
   const transformersPipeRef = useRef(null);
   const transformersModelRef = useRef('');
+  const utteranceRef = useRef(null);
+  const isCoachSpeakingRef = useRef(false);
+  const conversationTurnsRef = useRef([]);
   const [stream, setStream] = useState(null);
   const [cameraOn, setCameraOn] = useState(false);
   const [micOn, setMicOn] = useState(false);
@@ -247,10 +264,19 @@ function App() {
   const [speechStarted, setSpeechStarted] = useState(null);
   const [promptIndex, setPromptIndex] = useState(0);
   const [page, setPage] = useState('studio');
+  const [isCoachSpeaking, setIsCoachSpeaking] = useState(false);
   const [callActive, setCallActive] = useState(false);
   const [callEnded, setCallEnded] = useState(false);
   const [callTranscript, setCallTranscript] = useState('');
   const [conversationTurns, setConversationTurns] = useState([]);
+  // Mirror state in refs so recognition callbacks always see current values
+  const syncConversationTurns = (updater) => {
+    setConversationTurns((prev) => {
+      const next = typeof updater === 'function' ? updater(prev) : updater;
+      conversationTurnsRef.current = next;
+      return next;
+    });
+  };
   const [coachReply, setCoachReply] = useState('Start the call to hear the coach ask the first question.');
   const [coachStatus, setCoachStatus] = useState('Ollama local model ready when your server is running.');
   const [coachProvider, setCoachProvider] = useState('ollama');
@@ -269,7 +295,7 @@ function App() {
     if (!speechStarted || !wordCount) return 0;
     const minutes = Math.max((Date.now() - speechStarted) / 60000, 0.15);
     return Math.round(wordCount / minutes);
-  }, [speechStarted, wordCount, transcript]);
+  }, [speechStarted, wordCount]);
 
   const voiceStats = useMemo(() => {
     const paceScore = clamp(100 - Math.abs(wordsPerMinute - 145) * 0.65);
@@ -287,7 +313,7 @@ function App() {
   const callWpm = useMemo(() => {
     if (!callStarted || !callWords) return 0;
     return Math.round(callWords / Math.max((Date.now() - callStarted) / 60000, 0.15));
-  }, [callStarted, callWords, callTranscript]);
+  }, [callStarted, callWords]);
   const callConfidence = useMemo(
     () => clamp(stats.Confidence * 0.5 + voiceStats.confidence * 0.25 + callContent.substance * 0.25),
     [callContent.substance, stats.Confidence, voiceStats.confidence],
@@ -308,6 +334,10 @@ function App() {
       if (videoRef.current) videoRef.current.srcObject = media;
       setCameraOn(true);
       setNotice('');
+      // Warm up speech synthesis engine on user gesture
+      window.speechSynthesis?.getVoices();
+      const warmup = new SpeechSynthesisUtterance('');
+      window.speechSynthesis?.speak(warmup);
     } catch {
       setNotice('Camera or microphone permission was blocked. Allow access to start live analysis.');
     }
@@ -406,10 +436,41 @@ function App() {
   }
 
   function speakCoach(text) {
+    if (!text) return;
     window.speechSynthesis?.cancel();
+    window.speechSynthesis?.resume();
+
+    // Safety timeout to reset speaking state if events fail to fire (prevents recognition hang)
+    const safetyTimeout = setTimeout(() => {
+      if (isCoachSpeakingRef.current) {
+        setIsCoachSpeaking(false);
+        isCoachSpeakingRef.current = false;
+        utteranceRef.current = null;
+      }
+    }, 12000); // 12 second limit per response
+
     const utterance = new SpeechSynthesisUtterance(text);
-    utterance.rate = 0.92;
-    utterance.pitch = 0.92;
+    utteranceRef.current = utterance; // Keep reference to prevent GC
+
+    utterance.rate = 0.94;
+    utterance.pitch = 1.0;
+    utterance.onstart = () => {
+      setIsCoachSpeaking(true);
+      isCoachSpeakingRef.current = true;
+    };
+    utterance.onend = () => {
+      clearTimeout(safetyTimeout);
+      setIsCoachSpeaking(false);
+      isCoachSpeakingRef.current = false;
+      utteranceRef.current = null;
+    };
+    utterance.onerror = () => {
+      clearTimeout(safetyTimeout);
+      setIsCoachSpeaking(false);
+      isCoachSpeakingRef.current = false;
+      utteranceRef.current = null;
+    };
+
     window.speechSynthesis?.speak(utterance);
   }
 
@@ -425,22 +486,22 @@ function App() {
     const words = text.trim().split(/\s+/).filter(Boolean).length;
     const topic = extractTopic(text);
     if (words < 8) {
-      return `I heard you mention ${topic}. That sounds like there is more behind it. What made that stand out to you?`;
+      return `I noticed you mentioning ${topic}. That sounds like a significant starting point. Could you elaborate on what led you to that specific focus?`;
     }
     if (content.fillerWords > 3) {
-      return `The part about ${topic} is interesting. It sounds like there may have been a lot happening at once. What was the hardest part to explain or handle?`;
+      return `It sounds like there's a lot of complexity in ${topic}. When things get that busy, how do you usually prioritize what needs to be communicated first?`;
     }
     if (content.confidentWords < 1) {
-      return `I am curious about your role in ${topic}. What did you personally do that shaped the outcome?`;
+      return `I'm curious about the impact you had on ${topic}. If you were to describe your most decisive moment there, what would it be?`;
     }
     if (content.curiosity < 55) {
-      return `That gives me a clearer picture of ${topic}. How did that experience change the way you approach similar situations now?`;
+      return `That's a clear perspective on ${topic}. Considering what you know now, how might you approach a similar situation differently in the future?`;
     }
-    return `That is a useful example, especially the way you framed ${topic}. What did that experience teach you about how you work with people?`;
+    return `That's a very structured way to frame ${topic}. What did that experience reveal to you about your personal strengths in a team setting?`;
   }
 
-  async function askOllama(userText) {
-    const prompt = buildCoachPrompt(userText);
+  async function askOllama(userText, history = []) {
+    const prompt = buildCoachPrompt(userText, history);
 
     const response = await fetch(ollamaEndpoint, {
       method: 'POST',
@@ -461,41 +522,58 @@ function App() {
     }
 
     const data = await response.json();
-    return data.response?.trim() || buildCoachReply(userText);
+    const reply = data.response?.trim() || '';
+    const cleaned = cleanGeneratedReply(reply, prompt);
+    if (!cleaned) throw new Error('Empty AI response');
+    return cleaned;
   }
 
-  function buildCoachPrompt(userText) {
+  function buildCoachPrompt(userText, history = []) {
     const content = analyzeContent(userText);
     const topic = extractTopic(userText);
-    return `${conversationSystem}
+    const historyTranscript = history
+      .map((turn) => `${turn.speaker}: ${turn.text}`)
+      .join('\n');
 
-User's latest message: "${userText}"
+    return `### SYSTEM INSTRUCTIONS
+${conversationSystem}
+Output ONLY direct dialogue. No labels, no thoughts, no metadata.
 
-Private context you may use silently:
-- likely topic: ${topic}
-- user appears ${stats.Calm > 65 ? 'fairly calm' : 'a little tense'}
-- filler words: ${content.fillerWords}
-- content substance score: ${Math.round(content.substance)}%
+### CONVERSATION HISTORY
+${historyTranscript || 'No prior turns.'}
 
-Respond only with what you would say next in the call.`;
+### USER RESPONSE TO ANALYZE
+"${userText}"
+
+### ANALYSIS CONTEXT (DO NOT REPEAT)
+- Topic: ${topic}
+- User State: ${stats.Calm > 65 ? 'Calm' : 'Tense'}
+- Filler/Substance: ${content.fillerWords} / ${Math.round(content.substance)}%
+
+### FINAL RESPONSE INSTRUCTIONS
+Respond only with the next spoken sentence in this call. Do not use phrases like "User's response" or "Assistant". Start your dialogue immediately.`;
   }
 
   function cleanGeneratedReply(generatedText, prompt) {
-    const cleaned = generatedText
+    let cleaned = generatedText
       .replace(prompt, '')
       .replace(/<\/?s>|<\|.*?\|>/g, '')
+      .replace(/###.*?(\n|$)/g, '')
+      .replace(/(User's latest response|User response|User's response|Private context|likely topic|user appears|filler words|content substance score|SYSTEM INSTRUCTIONS|CONVERSATION HISTORY|ANALYSIS CONTEXT|FINAL RESPONSE INSTRUCTIONS).*?(\n|$)/gi, '')
       .replace(/^assistant[:\s-]*/i, '')
-      .trim()
-      .split('\n')
-      .filter(Boolean)
-      .slice(0, 2)
-      .join(' ')
-      || '';
-    const sentences = cleaned.match(/[^.!?]+[.!?]+/g);
-    return (sentences ? sentences.slice(0, 2).join(' ') : cleaned).slice(0, 320).trim();
+      .replace(/^coach[:\s-]*/i, '')
+      .trim();
+
+    // If the model just repeated the user's text or instructions
+    if (cleaned.length < 5 || /^(User|Assistant|Context|Topic|Response):/i.test(cleaned)) {
+      return '';
+    }
+
+    const sentences = cleaned.split('\n').filter(Boolean).join(' ').match(/[^.!?]+[.!?]+/g);
+    return (sentences ? sentences.slice(0, 2).join(' ') : cleaned.split('\n')[0]).slice(0, 320).trim();
   }
 
-  async function askTransformers(userText) {
+  async function askTransformers(userText, history = []) {
     const model = transformersModel.trim() || defaultTransformersModel;
     if (!transformersPipeRef.current || transformersModelRef.current !== model) {
       const { pipeline } = await import('@huggingface/transformers');
@@ -503,7 +581,7 @@ Respond only with what you would say next in the call.`;
       transformersModelRef.current = model;
     }
 
-    const prompt = buildCoachPrompt(userText);
+    const prompt = buildCoachPrompt(userText, history);
     const output = await transformersPipeRef.current(prompt, {
       max_new_tokens: 80,
       temperature: 0.75,
@@ -511,14 +589,16 @@ Respond only with what you would say next in the call.`;
       return_full_text: false,
     });
     const generated = Array.isArray(output) ? output[0]?.generated_text : output?.generated_text;
-    return cleanGeneratedReply(generated || '', prompt) || buildCoachReply(userText);
+    const cleaned = cleanGeneratedReply(generated || '', prompt);
+    if (!cleaned) throw new Error('Empty AI response');
+    return cleaned;
   }
 
-  async function askSelectedCoach(userText) {
+  async function askSelectedCoach(userText, history = []) {
     if (coachProvider === 'transformers') {
-      return askTransformers(userText);
+      return askTransformers(userText, history);
     }
-    return askOllama(userText);
+    return askOllama(userText, history);
   }
 
   function providerLabel() {
@@ -530,15 +610,16 @@ Respond only with what you would say next in the call.`;
 
   async function startPracticeCall() {
     if (!cameraOn) await startCamera();
+    setCallPromptIndex(0); // Reset to the first prompt
     setCallActive(true);
     setCallEnded(false);
     setCallTranscript('');
-    setConversationTurns([]);
+    syncConversationTurns([]);
     setCallStarted(Date.now());
     setCoachStatus(`Using ${providerLabel()}`);
-    const opening = callPrompts[callPromptIndex];
+    const opening = callPrompts[0]; // Explicitly use the first prompt
     setCoachReply(opening);
-    setConversationTurns([{ speaker: 'AI', text: opening }]);
+    syncConversationTurns([{ speaker: 'AI', text: opening }]);
     speakCoach(opening);
 
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -550,31 +631,43 @@ Respond only with what you would say next in the call.`;
     recognition.continuous = true;
     recognition.interimResults = true;
     recognition.onresult = (event) => {
+      // Ignore input if the coach is speaking to prevent feedback loops
+      if (isCoachSpeakingRef.current) return;
+
       const text = Array.from(event.results).map((result) => result[0].transcript).join(' ');
       setCallTranscript(text);
       const latest = event.results[event.results.length - 1];
       if (latest?.isFinal) {
         const userUtterance = latest[0]?.transcript?.trim();
         if (userUtterance) {
-          setConversationTurns((turns) => [...turns, { speaker: 'You', text: userUtterance }]);
+          syncConversationTurns((turns) => [...turns, { speaker: 'You', text: userUtterance }]);
         }
         window.clearTimeout(coachReplyTimerRef.current);
         coachReplyTimerRef.current = window.setTimeout(async () => {
+          // Double check if coach started speaking in the meantime
+          if (isCoachSpeakingRef.current) return;
+
           setCoachStatus(`Thinking with ${providerLabel()}`);
           try {
-            const reply = await askSelectedCoach(text);
+            const reply = await askSelectedCoach(userUtterance, conversationTurnsRef.current);
             setCoachReply(reply);
-            setConversationTurns((turns) => [...turns, { speaker: 'AI', text: reply }]);
+            syncConversationTurns((turns) => [...turns, { speaker: 'AI', text: reply }]);
             setCoachStatus(`Using ${providerLabel()}`);
             speakCoach(reply);
           } catch {
-            const reply = buildCoachReply(text);
+            const reply = buildCoachReply(userUtterance);
             setCoachReply(reply);
-            setConversationTurns((turns) => [...turns, { speaker: 'AI', text: reply }]);
+            syncConversationTurns((turns) => [...turns, { speaker: 'AI', text: reply }]);
             setCoachStatus(`${coachProvider === 'transformers' ? 'Transformers.js' : 'Ollama'} was not reachable, so the local fallback coach responded.`);
             speakCoach(reply);
           }
         }, 1000);
+      }
+    };
+    recognition.onend = () => {
+      // Auto-restart recognition if the call is still active (browser can stop it mid-call)
+      if (recognitionRef.current === recognition && callActive) {
+        try { recognition.start(); } catch { /* already started */ }
       }
     };
     recognitionRef.current = recognition;
@@ -594,7 +687,7 @@ Respond only with what you would say next in the call.`;
     const next = (callPromptIndex + 1) % callPrompts.length;
     setCallPromptIndex(next);
     setCoachReply(callPrompts[next]);
-    setConversationTurns((turns) => [...turns, { speaker: 'AI', text: callPrompts[next] }]);
+    syncConversationTurns((turns) => [...turns, { speaker: 'AI', text: callPrompts[next] }]);
     speakCoach(callPrompts[next]);
   }
 
